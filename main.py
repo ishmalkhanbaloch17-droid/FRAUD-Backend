@@ -161,11 +161,11 @@ async def analyze(file: UploadFile = File(...)):
     if 'Class' not in df.columns:
         return {"error": "No 'Class' column found. Please include labels (0 or 1)."}
 
-    # Limit to 3000 rows max to save memory
-    if len(df) > 3000:
+    # Limit to 5000 rows max
+    if len(df) > 5000:
         fraud = df[df['Class'] == 1]
         legit = df[df['Class'] == 0].sample(
-            n=min(2500, len(df[df['Class']==0])), random_state=42)
+            n=min(4500, len(df[df['Class']==0])), random_state=42)
         df = pd.concat([fraud, legit]).sample(frac=1, random_state=42)
 
     pca_file = is_pca_file(df)
@@ -204,6 +204,25 @@ async def analyze(file: UploadFile = File(...)):
 
     results_df = pd.DataFrame(results)
     best = results_df.loc[results_df['F1-Score'].idxmax(), 'Model']
+    best_model = models[best]
+
+    # Generate predictions table (first 20 from test set)
+    y_pred_best  = best_model.predict(X_test)
+    y_proba_best = best_model.predict_proba(X_test)[:, 1]
+
+    predictions = []
+    for i in range(min(20, len(X_test))):
+        actual    = int(y_test.iloc[i])
+        predicted = int(y_pred_best[i])
+        prob      = round(float(y_proba_best[i]) * 100, 2)
+        correct   = actual == predicted
+        predictions.append({
+            'transaction': i + 1,
+            'actual':      'FRAUD' if actual == 1 else 'LEGITIMATE',
+            'predicted':   'FRAUD' if predicted == 1 else 'LEGITIMATE',
+            'fraud_prob':  prob,
+            'correct':     correct
+        })
 
     return {
         "summary": {
@@ -213,7 +232,8 @@ async def analyze(file: UploadFile = File(...)):
             "fraud_percent": round(float(y.sum() / len(y) * 100), 4),
             "best_model":    best,
         },
-        "results": results,
+        "results":     results,
+        "predictions": predictions,
         "charts": {
             "class_dist":         chart_class_dist(y),
             "roc":                chart_roc(models, X_test, y_test),
