@@ -26,8 +26,8 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=False,
 )
-
 def is_pca_file(df):
     feature_cols = [c for c in df.columns if c not in ('Time','Amount','Class')]
     return all(c.startswith('V') and c[1:].isdigit() for c in feature_cols)
