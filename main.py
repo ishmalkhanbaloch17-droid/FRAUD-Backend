@@ -244,3 +244,44 @@ async def analyze(file: UploadFile = File(...)):
                                     X.columns.tolist()),
         }
     }
+@app.post("/predict")
+async def predict_single(transaction: dict):
+    try:
+        # Convert to dataframe
+        df = pd.DataFrame([transaction])
+
+        # Scale Time and Amount
+        sc = StandardScaler()
+        for col in ['Time', 'Amount']:
+            if col in df.columns:
+                df[col] = sc.fit_transform(df[[col]]).ravel()
+
+        # Train a quick model on sample data is not possible without training data
+        # So we use the transaction's V1-V28 features directly
+        feature_cols = [f'V{i}' for i in range(1, 29)
+                       if f'V{i}' in df.columns]
+        X = df[feature_cols].values
+
+        # Simple rule-based fallback using V14 and V10
+        # (top fraud indicators from Random Forest)
+        v14 = float(transaction.get('V14', 0))
+        v10 = float(transaction.get('V10', 0))
+        v12 = float(transaction.get('V12', 0))
+        v4  = float(transaction.get('V4',  0))
+
+        fraud_score = 0
+        if v14 < -5:  fraud_score += 40
+        if v14 < -3:  fraud_score += 20
+        if v10 < -3:  fraud_score += 20
+        if v12 < -3:  fraud_score += 15
+        if v4  < -2:  fraud_score += 15
+        fraud_score = min(fraud_score, 99)
+
+        predicted = 'FRAUD' if fraud_score >= 50 else 'LEGITIMATE'
+
+        return {
+            "predicted":         predicted,
+            "fraud_probability": fraud_score,
+        }
+    except Exception as e:
+        return {"error": str(e)}
