@@ -1,5 +1,7 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
 import pandas as pd
 import numpy as np
 import io, base64, matplotlib
@@ -28,6 +30,12 @@ app.add_middleware(
     allow_headers=["*"],
     allow_credentials=False,
 )
+
+# Global variables to store trained model and scaler
+trained_model = None
+trained_scaler = None
+trained_pca = None
+is_pca_dataset = None
 
 def is_pca_file(df):
     feature_cols = [c for c in df.columns if c not in ('Time','Amount','Class')]
@@ -155,6 +163,8 @@ def health():
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
+    global trained_model, trained_scaler, trained_pca, is_pca_dataset
+
     contents = await file.read()
     df = pd.read_csv(io.BytesIO(contents))
 
@@ -169,6 +179,17 @@ async def analyze(file: UploadFile = File(...)):
         df = pd.concat([fraud, legit]).sample(frac=1, random_state=42)
 
     pca_file = is_pca_file(df)
+    is_pca_dataset = pca_file
+
+    # Save scaler and pca for single transaction use
+    if not pca_file:
+        X_raw = df.drop('Class', axis=1)
+        trained_scaler = StandardScaler()
+        trained_scaler.fit(X_raw)
+        n = min(10, X_raw.shape[1])
+        trained_pca = PCA(n_components=n)
+        trained_pca.fit(trained_scaler.transform(X_raw))
+
     X, y = preprocess(df, pca_file)
 
     X_train, X_test, y_train, y_test = train_test_split(
@@ -204,11 +225,13 @@ async def analyze(file: UploadFile = File(...)):
 
     results_df = pd.DataFrame(results)
     best = results_df.loc[results_df['F1-Score'].idxmax(), 'Model']
-    best_model = models[best]
 
-    # Generate predictions table (first 20 from test set)
-    y_pred_best  = best_model.predict(X_test)
-    y_proba_best = best_model.predict_proba(X_test)[:, 1]
+    # Save best model globally for single predictions
+    trained_model = models[best]
+
+    # Predictions table
+    y_pred_best  = trained_model.predict(X_test)
+    y_proba_best = trained_model.predict_proba(X_test)[:, 1]
 
     predictions = []
     for i in range(min(20, len(X_test))):
@@ -244,44 +267,46 @@ async def analyze(file: UploadFile = File(...)):
                                     X.columns.tolist()),
         }
     }
+
 @app.post("/predict")
-async def predict_single(transaction: dict):
+async def predict_single(file: Optional[UploadFile] = File(None)):
+    global trained_model, trained_scaler, trained_pca, is_pca_dataset
+
+    if trained_model is None:
+        return {"error": "Please run Batch CSV Analysis first to train the model!"}
+
     try:
-        # Convert to dataframe
-        df = pd.DataFrame([transaction])
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
 
-        # Scale Time and Amount
-        sc = StandardScaler()
-        for col in ['Time', 'Amount']:
-            if col in df.columns:
-                df[col] = sc.fit_transform(df[[col]]).ravel()
+        # Remove Class column if present
+        if 'Class' in df.columns:
+            df = df.drop('Class', axis=1)
 
-        # Train a quick model on sample data is not possible without training data
-        # So we use the transaction's V1-V28 features directly
-        feature_cols = [f'V{i}' for i in range(1, 29)
-                       if f'V{i}' in df.columns]
-        X = df[feature_cols].values
+        # Take only first row
+        df = df.iloc[[0]]
 
-        # Simple rule-based fallback using V14 and V10
-        # (top fraud indicators from Random Forest)
-        v14 = float(transaction.get('V14', 0))
-        v10 = float(transaction.get('V10', 0))
-        v12 = float(transaction.get('V12', 0))
-        v4  = float(transaction.get('V4',  0))
+        # Apply same preprocessing as training
+        if not is_pca_dataset and trained_scaler and trained_pca:
+            X_scaled = trained_scaler.transform(df)
+            X = pd.DataFrame(
+                trained_pca.transform(X_scaled),
+                columns=[f'V{i+1}' for i in range(trained_pca.n_components_)]
+            )
+        else:
+            sc = StandardScaler()
+            for col in ['Time', 'Amount']:
+                if col in df.columns:
+                    df[col] = sc.fit_transform(df[[col]]).ravel()
+            X = df
 
-        fraud_score = 0
-        if v14 < -5:  fraud_score += 40
-        if v14 < -3:  fraud_score += 20
-        if v10 < -3:  fraud_score += 20
-        if v12 < -3:  fraud_score += 15
-        if v4  < -2:  fraud_score += 15
-        fraud_score = min(fraud_score, 99)
-
-        predicted = 'FRAUD' if fraud_score >= 50 else 'LEGITIMATE'
+        pred  = trained_model.predict(X)[0]
+        proba = round(float(trained_model.predict_proba(X)[0][1]) * 100, 2)
 
         return {
-            "predicted":         predicted,
-            "fraud_probability": fraud_score,
+            "predicted":         "FRAUD" if pred == 1 else "LEGITIMATE",
+            "fraud_probability": proba,
         }
+
     except Exception as e:
         return {"error": str(e)}
