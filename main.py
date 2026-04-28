@@ -35,6 +35,7 @@ trained_model  = None
 trained_scaler = None
 trained_pca    = None
 is_pca_dataset = None
+trained_columns = None
 
 def is_pca_file(df):
     feature_cols = [c for c in df.columns if c not in ('Time','Amount','Class')]
@@ -142,23 +143,28 @@ def health():
 
 @app.post("/analyze")
 async def analyze(file: UploadFile = File(...)):
-    global trained_model, trained_scaler, trained_pca, is_pca_dataset
+    global trained_model, trained_scaler, trained_pca, is_pca_dataset, trained_columns
 
     contents = await file.read()
     df = pd.read_csv(io.BytesIO(contents))
 
-    has_class = 'Class' in df.columns
-    pca_file  = is_pca_file(df)
+    has_class  = 'Class' in df.columns
+    pca_file   = is_pca_file(df)
     is_pca_dataset = pca_file
 
-    # ── NO CLASS COLUMN → just predict every row ──────────────
+    # ── NO CLASS COLUMN → predict only ────────────────────────
     if not has_class:
         if trained_model is None:
-            return {"error": "No 'Class' column found and no model trained yet. Please upload a labeled CSV first to train the model, then upload unlabeled data for predictions."}
+            return {"error": "No 'Class' column found and no model trained yet. Please upload a labeled CSV first to train the model."}
 
         X_input = df.copy()
 
         if not pca_file and trained_scaler and trained_pca:
+            # Align columns to training columns
+            for col in trained_columns:
+                if col not in X_input.columns:
+                    X_input[col] = 0
+            X_input = X_input[trained_columns]
             X_scaled = trained_scaler.transform(X_input)
             X_ready  = pd.DataFrame(
                 trained_pca.transform(X_scaled),
@@ -199,15 +205,18 @@ async def analyze(file: UploadFile = File(...)):
             "charts":      {}
         }
 
-    # ── HAS CLASS COLUMN → full training pipeline ──────────────
+    # ── HAS CLASS COLUMN → full training ──────────────────────
     if len(df) > 5000:
         fraud = df[df['Class'] == 1]
         legit = df[df['Class'] == 0].sample(
             n=min(4500, len(df[df['Class']==0])), random_state=42)
         df = pd.concat([fraud, legit]).sample(frac=1, random_state=42)
 
-    y = df['Class'].astype(int)
+    y     = df['Class'].astype(int)
     X_raw = df.drop('Class', axis=1)
+
+    # Save column order for single transaction prediction
+    trained_columns = list(X_raw.columns)
 
     if not pca_file:
         trained_scaler = StandardScaler()
@@ -252,8 +261,8 @@ async def analyze(file: UploadFile = File(...)):
         })
         cms[name] = confusion_matrix(y_test, y_pred)
 
-    results_df   = pd.DataFrame(results)
-    best         = results_df.loc[results_df['F1-Score'].idxmax(), 'Model']
+    results_df    = pd.DataFrame(results)
+    best          = results_df.loc[results_df['F1-Score'].idxmax(), 'Model']
     trained_model = models[best]
 
     y_pred_best  = trained_model.predict(X_test)
@@ -296,7 +305,7 @@ async def analyze(file: UploadFile = File(...)):
 
 @app.post("/predict")
 async def predict_single(file: UploadFile = File(...)):
-    global trained_model, trained_scaler, trained_pca, is_pca_dataset
+    global trained_model, trained_scaler, trained_pca, is_pca_dataset, trained_columns
 
     if trained_model is None:
         return {"error": "Please run Batch CSV Analysis first to train the model!"}
@@ -312,6 +321,10 @@ async def predict_single(file: UploadFile = File(...)):
         pca_file = is_pca_file(df)
 
         if not pca_file and trained_scaler and trained_pca:
+            for col in trained_columns:
+                if col not in df.columns:
+                    df[col] = 0
+            df = df[trained_columns]
             X_scaled = trained_scaler.transform(df)
             X = pd.DataFrame(
                 trained_pca.transform(X_scaled),
